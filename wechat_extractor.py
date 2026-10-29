@@ -412,12 +412,27 @@ def process_image(
 
     image = Image.open(BytesIO(data))
     max_dim = config.FEISHU_EMOJI_DIMENSION
+    frame_count = getattr(image, "n_frames", 1)
+
+    if frame_count > 1:
+        # 其他动画格式及无需缩放的 GIF 保留原始字节，避免静态保存路径丢帧。
+        if fmt != "gif" or max(image.size) <= max_dim:
+            return data
+        ratio = max_dim / max(image.size)
+        new_size = (max(1, int(image.size[0] * ratio)), max(1, int(image.size[1] * ratio)))
+        try:
+            resized = _resize_gif(image, new_size)
+            with Image.open(BytesIO(resized)) as check:
+                if check.n_frames == frame_count:
+                    return resized
+        except Exception:
+            pass
+        # 编码失败或帧数改变时保留原动画，禁止退化为静态首帧。
+        return data
 
     if max(image.size) > max_dim:
         ratio = max_dim / max(image.size)
         new_size = (int(image.size[0] * ratio), int(image.size[1] * ratio))
-        if fmt == "gif" and getattr(image, "n_frames", 1) > 1:
-            return _resize_gif(image, new_size)
         image = image.resize(new_size, Image.Resampling.LANCZOS)
 
     output = BytesIO()
@@ -443,30 +458,27 @@ def process_image(
 def _resize_gif(image: Image.Image, new_size: tuple[int, int]) -> bytes:
     frames = []
     durations = []
-    try:
-        for frame_index in range(image.n_frames):
-            image.seek(frame_index)
-            frame = image.copy().resize(new_size, Image.Resampling.LANCZOS)
-            frames.append(frame)
-            durations.append(image.info.get("duration", 100))
+    image.seek(0)
+    loop = image.info.get("loop")
+    for frame_index in range(image.n_frames):
+        image.seek(frame_index)
+        frame = image.convert("RGBA").resize(new_size, Image.Resampling.LANCZOS)
+        frames.append(frame)
+        durations.append(image.info.get("duration", 100))
 
-        output = BytesIO()
-        frames[0].save(
-            output,
-            format="GIF",
-            save_all=True,
-            append_images=frames[1:],
-            duration=durations,
-            loop=image.info.get("loop", 0),
-            optimize=True,
-        )
-        return output.getvalue()
-    except Exception:
-        output = BytesIO()
-        image.seek(0)
-        fallback = image.copy().resize(new_size, Image.Resampling.LANCZOS)
-        fallback.save(output, format="GIF")
-        return output.getvalue()
+    output = BytesIO()
+    save_kwargs = {"loop": loop} if loop is not None else {}
+    frames[0].save(
+        output,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=durations,
+        disposal=2,
+        optimize=True,
+        **save_kwargs,
+    )
+    return output.getvalue()
 
 
 def extract_emojis(
