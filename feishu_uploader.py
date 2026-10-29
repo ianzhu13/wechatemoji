@@ -942,6 +942,11 @@ class FeishuUploader:
             return self._page.evaluate(
                 """(limit) => Array
                     .from(document.querySelectorAll('.customized-sticker-item img'))
+                    .filter(img => {
+                        const item = img.closest('.customized-sticker-item');
+                        return item.getClientRects().length > 0 &&
+                            getComputedStyle(item).visibility !== 'hidden';
+                    })
                     .slice(0, limit)
                     .map(img => img.getAttribute('src') || '')""",
                 limit,
@@ -977,7 +982,13 @@ class FeishuUploader:
                 if current[0] not in baseline and current[1:] == baseline[: len(current) - 1]:
                     return True, "new custom emoji appeared at the front of the list"
             time.sleep(0.4)
-        return False, "未检测到明确成功提示或列表变化，已按失败处理"
+        self._report(
+            f"[诊断] 上传结果未确认：选择前列表采样 {len(baseline)} 项，"
+            f"当前列表采样 {len(self._capture_custom_sticker_signature())} 项，"
+            f"自定义面板可见={self._is_sticker_panel_visible()}"
+        )
+        self._screenshot("personal_upload_unconfirmed")
+        return False, "文件已交给页面，但未确认添加结果；已停止本批，不会自动重复提交"
 
     def wait_for_browser_close(self, stop_check: StopCheck = None) -> None:
         """处理未完成时保留现场，浏览器操作仍留在所属线程。"""

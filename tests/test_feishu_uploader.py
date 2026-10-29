@@ -272,6 +272,7 @@ class BrowserLoginTests(unittest.TestCase):
         self.uploader = FeishuUploader()
         self.uploader._page = self.page
         self.uploader._report = Mock()
+        self.uploader._screenshot = Mock()
 
     def test_delayed_login_redirect_and_chat_loading(self):
         def serve(route):
@@ -363,6 +364,37 @@ class BrowserLoginTests(unittest.TestCase):
         ):
             result, _ = self.uploader._wait_personal_upload_result(["first", "second"], timeout_ms=20)
         self.assertFalse(result)
+
+    def test_signature_ignores_cached_hidden_sticker_panels(self):
+        self.serve_upload_fixture()
+        self.page.evaluate("""() => {
+            selectChat(1); openPanel();
+            const cache = document.createElement('div'); cache.style.display = 'none';
+            cache.innerHTML = Array.from({length: 20}, (_, i) =>
+                `<div class="customized-sticker-item"><img src="/cached-${i}.gif"></div>`).join('');
+            document.body.prepend(cache);
+        }""")
+        self.assertEqual(self.uploader._capture_custom_sticker_signature(), ["/base.gif"])
+
+    def test_third_upload_is_confirmed_when_old_panel_is_cached(self):
+        self.serve_upload_fixture()
+
+        def cache_old_items(message, *args):
+            if message == "[上传] 已确认 2/3":
+                self.page.evaluate("""() => {
+                    const cache = document.createElement('div'); cache.style.display = 'none';
+                    cache.innerHTML = document.querySelector('#stickers').innerHTML.repeat(5);
+                    document.body.prepend(cache);
+                }""")
+
+        self.uploader._report.side_effect = cache_old_items
+        with tempfile.TemporaryDirectory() as directory:
+            files = [Path(directory) / name for name in ("one.gif", "two.gif", "three.gif")]
+            for file in files:
+                file.write_bytes(b"GIF89a synthetic fixture")
+            result = self.uploader.upload_personal_emojis([str(file) for file in files])
+        self.assertEqual(result, {"success": 3, "failed": 0})
+        self.assertEqual(self.page.evaluate("window.uploadNames"), ["one.gif", "two.gif", "three.gif"])
 
     def test_personal_confirmation_only_clicks_inside_upload_dialog(self):
         self.serve_upload_fixture()
