@@ -464,6 +464,8 @@ def cmd_start_upload(ctx: BridgeContext, payload: dict[str, Any]) -> None:
 
         try:
             if not uploader.login(stop_check=should_stop):
+                if not should_stop():
+                    uploader.wait_for_browser_close(stop_check=should_stop)
                 ctx.emit("busyState", {"busy": False, "action": ""})
                 ctx.finish(payload={"ok": False, "stopped": should_stop()})
                 return
@@ -473,6 +475,10 @@ def cmd_start_upload(ctx: BridgeContext, payload: dict[str, Any]) -> None:
             else:
                 result = uploader.upload_enterprise_emojis(files, pack_name=pack_name, stop_check=should_stop)
 
+            if (result.get("failed") or result.get("skipped")) and not should_stop():
+                if result.get("message"):
+                    ctx.log(result["message"], "warn")
+                uploader.wait_for_browser_close(stop_check=should_stop)
             stopped = os.path.exists(stop_path)
             if stopped:
                 os.remove(stop_path)
@@ -481,12 +487,20 @@ def cmd_start_upload(ctx: BridgeContext, payload: dict[str, Any]) -> None:
             else:
                 success = result.get("success", 0)
                 failed = result.get("failed", 0)
-                tone = "success" if failed == 0 and success > 0 else ("warning" if success > 0 else "error")
-                ctx.emit("progress", {"which": "upload", "percent": 100 if success or failed else 0})
-                ctx.emit("uploadStatus", {"text": f"import done: success {success}, failed {failed}", "tone": tone})
-                ctx.log(f"feishu import done: success {success}, failed {failed}", "success" if failed == 0 else "warn")
+                skipped = result.get("skipped", 0)
+                tone = "warning" if skipped else ("success" if failed == 0 and success > 0 else ("warning" if success > 0 else "error"))
+                processed = success + failed
+                percent = int(100 * processed / (processed + skipped)) if processed + skipped else 0
+                summary = result.get("message", f"import done: success {success}, failed {failed}")
+                ctx.emit("progress", {"which": "upload", "percent": percent})
+                ctx.emit("uploadStatus", {"text": summary, "tone": tone})
+                ctx.log(summary, "success" if tone == "success" else "warn")
 
-            ctx.finish(payload={"ok": True, "stopped": stopped, **result})
+            ctx.finish(payload={"ok": not stopped and not result.get("failed") and not result.get("skipped"), "stopped": stopped, **result})
+        except Exception:
+            if not should_stop():
+                uploader.wait_for_browser_close(stop_check=should_stop)
+            raise
         finally:
             try:
                 uploader.close()

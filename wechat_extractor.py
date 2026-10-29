@@ -58,7 +58,10 @@ def get_wechat_info() -> list[dict]:
             continue
 
         for entry in os.listdir(root_dir):
-            if not entry.startswith("wxid_"):
+            if not (
+                entry.startswith("wxid_")
+                or os.path.isdir(os.path.join(root_dir, entry, "db_storage"))
+            ):
                 continue
             full_dir = os.path.join(root_dir, entry)
             if not os.path.isdir(full_dir):
@@ -129,7 +132,10 @@ def discover_wechat_users() -> list[str]:
             continue
         for entry in os.listdir(root_dir):
             full_path = os.path.join(root_dir, entry)
-            if os.path.isdir(full_path) and entry.startswith("wxid_"):
+            if os.path.isdir(full_path) and (
+                entry.startswith("wxid_")
+                or os.path.isdir(os.path.join(full_path, "db_storage"))
+                ):
                 users.add(entry)
     return sorted(users)
 

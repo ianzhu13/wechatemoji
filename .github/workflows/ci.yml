@@ -40,6 +40,9 @@ jobs:
             stage_playwright_runtime.py `
             sniff_feishu.py
 
+      - name: Run offline regression tests
+        run: python -m unittest discover -s tests -v
+
   tauri-shell:
     name: Tauri shell check
     runs-on: windows-latest

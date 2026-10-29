@@ -21,7 +21,7 @@
 ### 运行环境
 
 - Windows
-- Python 3.10+
+- Python 3.11+（数据库完整性验证需要 `sqlite3.deserialize`）
 - 已安装微信客户端
 - 如需验证飞书上传，请安装 Playwright Chromium
 

@@ -40,17 +40,22 @@ _SIDEBAR_CHAT_SELECTORS = (
     '[role="listitem"]',
 )
 
+_MESSENGER_READY_SELECTORS = (
+    '[contenteditable="true"]',
+    '.lark__editor--toolbar',
+    '.a11y_feed_card_item',
+)
+
 # ── 消息输入框工具栏里的表情/贴纸按钮 ──
 # 2025/04 实测：飞书工具栏容器类为 .lark__editor--toolbar，
 # 表情/贴纸是第2个 div 里的按钮（tooltip="表情"）。
 # 点击后直接显示自定义贴纸面板，无需切换 tab。
 _EMOJI_BTN_SELECTORS = (
+    '.lark__editor--toolbar button[aria-label*="表情"]',
+    '.lark__editor--toolbar button[title*="表情"]',
     '.lark__editor--toolbar > div:nth-child(2) button',
     '.lark__editor--toolbar > div:nth-child(2) > div > .ud__button',
     '[class*="lark__editor--toolbar"] > div:nth-child(2) button',
-    # 宽松回退
-    '[class*="lark__editor"] button:nth-of-type(2)',
-    '[class*="toolbar"] button:nth-of-type(2)',
 )
 
 # ── 表情面板里"自定义"tab（飞书点击表情按钮直接进自定义面板，通常不需要）──
@@ -68,8 +73,6 @@ _ADD_BTN_SELECTORS = (
     '.add-sticker-btn',
     '[class*="add-sticker-btn"]',
     '.customized-sticker-item.add-sticker-btn',
-    '[class*="add-btn"]',
-    'button:has-text("+")',
 )
 
 # ── 上传后的确认按钮 ──
@@ -118,6 +121,7 @@ _ADMIN_PACK_NAME_INPUT = (
 
 _SUCCESS_TEXTS = ("上传成功", "添加成功", "已添加", "已上传", "保存成功", "创建成功", "发布成功")
 _ERROR_TEXTS = ("上传失败", "添加失败", "格式不支持", "上传出错", "大小超限", "数量超限", "格式错误")
+_UPLOAD_FEEDBACK_SELECTOR = ':is([role="alert"], [role="status"], .ud__toast, .ud__message, [class*="toast"]):visible'
 
 BROWSER_CANDIDATES = (
     {
@@ -391,15 +395,15 @@ class FeishuUploader:
             self._page.wait_for_load_state("load", timeout=8000)
         except Exception:
             pass
-        time.sleep(1.5)
+        self._page.wait_for_timeout(1500)
 
         if self._is_logged_in():
             self._report("[登录] 已检测到登录态，无需扫码")
             return True
 
         self._report(
-            "[登录] 请在弹出的浏览器窗口中扫码登录飞书，"
-            f"登录完成后工具会自动继续（最多等待 {config.LOGIN_TIMEOUT // 1000} 秒）"
+            "[登录] 请在弹出的浏览器窗口中完成飞书登录，并等待消息列表加载；"
+            f"聊天页面就绪后工具会自动继续（最多等待 {config.LOGIN_TIMEOUT // 1000} 秒）"
         )
         deadline = time.time() + config.LOGIN_TIMEOUT / 1000
         while time.time() < deadline:
@@ -409,9 +413,10 @@ class FeishuUploader:
             if self._is_logged_in():
                 self._report("[登录] 登录成功")
                 return True
-            time.sleep(1.5)
+            # 普通 sleep 不处理 Playwright 事件，page.url 会一直停留在扫码前的登录地址。
+            self._page.wait_for_timeout(1500)
 
-        self._report("[错误] 登录超时，请重试")
+        self._report("[错误] 登录或消息页加载超时；若只有头像和灰色占位，请确认消息列表能正常加载后重试")
         return False
 
     def _is_logged_in(self) -> bool:
@@ -422,16 +427,12 @@ class FeishuUploader:
             if any(k in url for k in ("accounts.feishu.cn", "/login", "passport", "sso")):
                 return False
             if "/messenger/" in url or "/im/" in url:
-                # 页面上能找到侧边栏或输入框即视为已登录
-                for sel in ('[class*="sidebar"]', '[class*="im-left"]',
-                            '[class*="conversation"]', '[contenteditable="true"]',
-                            '[role="main"]'):
+                for sel in _MESSENGER_READY_SELECTORS:
                     try:
-                        if self._page.locator(sel).count() > 0:
+                        if self._page.locator(sel).first.is_visible():
                             return True
                     except Exception:
                         pass
-                return True
         except Exception:
             pass
         return False
@@ -449,21 +450,10 @@ class FeishuUploader:
         self._report("[提示] 如果浏览器自动操作失败，工具会切换为半自动模式：")
         self._report("[提示] 请手动在飞书聊天页面点击「表情/贴纸」按钮 → 「自定义」→「添加」，然后工具会自动注入文件")
 
-        # 确保在 messenger 页面
-        try:
-            self._page.goto(config.FEISHU_MESSENGER_URL, wait_until="domcontentloaded")
-            time.sleep(2)
-        except Exception:
-            pass
-        self._wait_for_messenger_ready()
-
         success = 0
         failed = 0
-        # 全自动成功次数，连续失败超过 3 次则切换半自动
-        auto_fail_streak = 0
-
         for index, filepath in enumerate(emoji_files, start=1):
-            if stop_check and stop_check():
+            if self._stop_requested(stop_check):
                 self._report(f"[信息] 用户中止上传，已上传 {success} 个，跳过剩余 {total - index + 1} 个")
                 break
 
@@ -471,59 +461,64 @@ class FeishuUploader:
             self._report(f"[上传] ({index}/{total}) {name}", index - 1, total)
 
             try:
-                if auto_fail_streak < 3:
-                    ok = self._upload_personal_auto(filepath, stop_check=stop_check)
-                else:
-                    ok = self._upload_personal_semi_auto(filepath, index, total, stop_check=stop_check)
-
-                if ok:
-                    success += 1
-                    auto_fail_streak = 0
-                else:
-                    failed += 1
-                    auto_fail_streak += 1
+                ok = self._upload_personal_auto(filepath, stop_check=stop_check)
             except Exception as exc:
                 self._report(f"[错误] 上传 {name} 时异常: {exc}", index, total)
                 self._screenshot(f"error_personal_{index}")
+                ok = False
+            if not ok:
+                if self._stop_requested(stop_check):
+                    break
                 failed += 1
-                auto_fail_streak += 1
+                self._report("[中断] 当前文件导入未确认，已停止本批；剩余文件未继续尝试")
+                break
+            success += 1
+            self._report(f"[上传] 已确认 {success}/{total}", success + failed, total)
 
-            time.sleep(0.5)
-
-        self._report(f"[完成] 个人表情上传结束: 成功 {success}，失败 {failed}", total, total)
+        skipped = total - success - failed
+        if skipped:
+            message = f"导入已中断：成功 {success}，失败或未确认 {failed}，未尝试 {skipped}"
+            self._report(f"[中断] {message}", success + failed, total)
+            return {"success": success, "failed": failed, "skipped": skipped, "message": message}
+        self._report(f"[完成] 个人表情上传结束: 成功 {success}，失败 {failed}", success + failed, total)
         return {"success": success, "failed": failed}
 
     def _upload_personal_auto(self, filepath: str, stop_check: StopCheck = None) -> bool:
         """全自动：模拟点击表情面板，注入文件。"""
-        # Step 1: 确保有聊天会话被选中（侧边栏第一个）
-        self._try_open_first_chat()
-        if not self._wait_for_messenger_ready(stop_check=stop_check):
-            self._report("[警告] 未能让飞书聊天输入区进入可操作状态")
+        if self._stop_requested(stop_check):
             return False
-
-        # Step 2: 打开表情面板并切到“爱心”自定义表情页
-        if not self._open_emoji_panel():
-            self._screenshot("fail_open_emoji_panel")
-            return False
+        if not self._is_sticker_panel_visible():
+            if not self._try_open_first_chat(stop_check=stop_check) or not self._open_emoji_panel():
+                self._screenshot("fail_open_emoji_panel")
+                return self._upload_personal_semi_auto(filepath, stop_check=stop_check)
 
         before_signature = self._capture_custom_sticker_signature()
+        before_feedback = self._capture_upload_feedback()
 
         # Step 3: 点击添加按钮，同时捕获文件选择器
         try:
             with self._page.expect_file_chooser(timeout=5000) as fc_info:
-                self._try_click_add_emoji()
-            fc_info.value.set_files(filepath)
+                if not self._try_click_add_emoji():
+                    raise RuntimeError("未找到自定义表情添加按钮")
+            chooser = fc_info.value
         except Exception as exc:
             self._screenshot("fail_file_chooser")
-            self._report(f"[警告] 文件注入失败: {exc}")
+            self._report(f"[警告] 未打开表情文件选择器: {type(exc).__name__}")
+            return self._upload_personal_semi_auto(filepath, stop_check=stop_check)
+
+        try:
+            chooser.set_files(filepath)
+        except Exception as exc:
+            self._report(f"[警告] 文件提交结果未确认，停止自动重试: {type(exc).__name__}")
             return False
 
-        time.sleep(1)
-        self._try_confirm_upload()
+        self._page.wait_for_timeout(300)
+        self._try_confirm_upload(dialog_only=True)
         ok, msg = self._wait_personal_upload_result(
             before_signature,
             timeout_ms=10000,
             stop_check=stop_check,
+            before_feedback=before_feedback,
         )
         self._report(f"[信息] {msg}")
         return ok
@@ -531,41 +526,64 @@ class FeishuUploader:
     def _upload_personal_semi_auto(
         self,
         filepath: str,
-        index: int,
-        total: int,
         stop_check: StopCheck = None,
     ) -> bool:
         """半自动：等待用户手动打开表情上传对话框，工具自动注入文件。"""
-        self._report(
-            f"[半自动] ({index}/{total}) 请在飞书浏览器中手动点击「表情/贴纸」→「自定义」→「添加」按钮，"
-            f"工具检测到上传框后会自动注入文件（等待 30 秒）"
-        )
-        file_input = self._find_file_input(timeout=30000, stop_check=stop_check)
-        if not file_input:
-            if self._stop_requested(stop_check):
-                self._report("[信息] 上传已中止")
-                return False
-            self._report(f"[警告] 超时未检测到上传框，跳过: {os.path.basename(filepath)}")
-            return False
+        choosers = []
+        def listener(chooser):
+            choosers.append(chooser)
 
-        file_input.set_input_files(filepath)
-        time.sleep(1)
-        self._try_confirm_upload()
-        ok, msg = self._wait_feedback(timeout_ms=6000, stop_check=stop_check)
+        self._page.on("filechooser", listener)
+        try:
+            self._report(
+                "[半自动] 当前文件尚未提交；请在可输入消息的会话中点击「表情」→「自定义」→「添加」，"
+                "工具会接管文件选择并继续导入同一张图片（等待 30 秒）"
+            )
+            deadline = time.monotonic() + 30
+            while not choosers and time.monotonic() < deadline:
+                if self._stop_requested(stop_check):
+                    return False
+                self._page.wait_for_timeout(200)
+            if not choosers or self._stop_requested(stop_check):
+                self._report("[警告] 未打开自定义表情文件选择器，本批导入已停止")
+                return False
+            if not self._is_sticker_panel_visible():
+                self._report("[警告] 当前文件入口未确认为自定义表情，未提交图片")
+                return False
+            before_signature = self._capture_custom_sticker_signature()
+            before_feedback = self._capture_upload_feedback()
+            choosers[0].set_files(filepath)
+        finally:
+            self._page.remove_listener("filechooser", listener)
+        self._page.wait_for_timeout(300)
+        self._try_confirm_upload(dialog_only=True)
+        ok, msg = self._wait_personal_upload_result(
+            before_signature, stop_check=stop_check, before_feedback=before_feedback,
+        )
         self._report(f"[信息] {msg}")
         return bool(ok)
 
-    def _try_open_first_chat(self):
-        """尝试点击侧边栏第一个会话，确保 chat 输入框可用。"""
-        for sel in _SIDEBAR_CHAT_SELECTORS:
+    def _try_open_first_chat(self, stop_check: StopCheck = None) -> bool:
+        """保留已有输入区；跳过无输入区的通知会话。"""
+        editor = self._page.locator('.lark__editor--toolbar').first
+        if editor.is_visible():
+            return True
+        self._report("[定位] 寻找可输入消息的会话，通知类会话会跳过")
+        chats = self._page.locator(", ".join(_SIDEBAR_CHAT_SELECTORS))
+        # shortcut: 只尝试前 10 个会话，全部只读时由用户手动选择可编辑会话。
+        for index in range(min(chats.count(), 10)):
+            if self._stop_requested(stop_check):
+                return False
             try:
-                loc = self._page.locator(sel).first
-                if loc.is_visible(timeout=1000):
-                    loc.click()
-                    time.sleep(0.8)
-                    return
+                chat = chats.nth(index)
+                if not chat.is_visible():
+                    continue
+                chat.click(timeout=1500)
+                editor.wait_for(state="visible", timeout=1500)
+                return True
             except Exception:
                 continue
+        return False
 
     def _wait_for_messenger_ready(self, timeout_ms: int = 12000, stop_check: StopCheck = None) -> bool:
         if not self._page:
@@ -574,14 +592,9 @@ class FeishuUploader:
         while time.time() < deadline:
             if self._stop_requested(stop_check):
                 return False
-            for sel in (
-                '[contenteditable="true"]',
-                '.lark__editor--toolbar',
-                '.a11y_feed_card_item',
-                '.feed-main-list',
-            ):
+            for sel in _MESSENGER_READY_SELECTORS:
                 try:
-                    if self._page.locator(sel).count() > 0:
+                    if self._page.locator(sel).first.is_visible():
                         return True
                 except Exception:
                     pass
@@ -596,7 +609,7 @@ class FeishuUploader:
                 loc = self._page.locator(sel).first
                 if loc.is_visible(timeout=800):
                     loc.click()
-                    time.sleep(0.3)
+                    self._page.wait_for_timeout(300)
                     break
             except Exception:
                 pass
@@ -610,7 +623,7 @@ class FeishuUploader:
                 loc = self._page.locator(sel).first
                 if loc.is_visible(timeout=1200):
                     loc.click()
-                    time.sleep(0.8)
+                    self._page.wait_for_timeout(800)
                     if self._switch_personal_sticker_tab():
                         return True
             except Exception:
@@ -648,7 +661,7 @@ class FeishuUploader:
             buttons = self._page.locator('.emoji button.ud__button--icon.ud__button--icon-size-md')
             if buttons.count() >= 3:
                 buttons.nth(2).click()
-                time.sleep(0.8)
+                self._page.wait_for_timeout(800)
                 if self._is_sticker_panel_visible():
                     return True
         except Exception:
@@ -663,12 +676,12 @@ class FeishuUploader:
                 loc = self._page.locator(sel)
                 if sel.startswith('.emoji button') and loc.count() >= 3:
                     loc.nth(2).click()
-                    time.sleep(0.5)
+                    self._page.wait_for_timeout(500)
                     return
                 first = loc.first
                 if first.is_visible(timeout=1500):
                     first.click()
-                    time.sleep(0.5)
+                    self._page.wait_for_timeout(500)
                     return
             except Exception:
                 continue
@@ -679,15 +692,18 @@ class FeishuUploader:
                 loc = self._page.locator(sel).first
                 if loc.is_visible(timeout=1500):
                     loc.click()
-                    time.sleep(0.5)
-                    return
+                    return True
             except Exception:
                 continue
+        return False
 
-    def _try_confirm_upload(self):
+    def _try_confirm_upload(self, dialog_only: bool = False):
+        scope = self._page
+        if dialog_only:
+            scope = self._page.locator('[role="dialog"]:visible, .ud__modal:visible, .ud__dialog:visible').last
         for sel in _CONFIRM_SELECTORS:
             try:
-                loc = self._page.locator(sel).first
+                loc = scope.locator(sel).first
                 if loc.is_visible(timeout=1000):
                     loc.click()
                     time.sleep(0.4)
@@ -896,16 +912,14 @@ class FeishuUploader:
         timeout_ms: int = 8000,
         stop_check: StopCheck = None,
         fail_on_timeout: bool = True,
+        before_feedback: tuple[str, ...] = (),
     ) -> tuple[Optional[bool], str]:
         """等待页面出现成功/失败提示文字。"""
         deadline = time.time() + timeout_ms / 1000
         while time.time() < deadline:
             if self._stop_requested(stop_check):
                 return False, "上传已中止"
-            try:
-                body = self._page.locator("body").inner_text(timeout=1000)
-            except Exception:
-                body = ""
+            body = "\n".join(text for text in self._capture_upload_feedback() if text not in before_feedback)
             if any(t in body for t in _ERROR_TEXTS):
                 return False, "检测到上传失败提示，请检查文件格式、大小或飞书权限"
             if any(t in body for t in _SUCCESS_TEXTS):
@@ -914,6 +928,12 @@ class FeishuUploader:
         if fail_on_timeout:
             return False, "未检测到明确成功提示，已按失败处理"
         return None, ""
+
+    def _capture_upload_feedback(self) -> tuple[str, ...]:
+        try:
+            return tuple(self._page.locator(_UPLOAD_FEEDBACK_SELECTOR).all_inner_texts())
+        except Exception:
+            return ()
 
     def _capture_custom_sticker_signature(self, limit: int = 12) -> list[str]:
         if not self._page:
@@ -934,6 +954,7 @@ class FeishuUploader:
         before_signature: list[str],
         timeout_ms: int = 10000,
         stop_check: StopCheck = None,
+        before_feedback: tuple[str, ...] = (),
     ) -> tuple[bool, str]:
         deadline = time.time() + timeout_ms / 1000
         baseline = before_signature or []
@@ -942,6 +963,7 @@ class FeishuUploader:
                 timeout_ms=800,
                 stop_check=stop_check,
                 fail_on_timeout=False,
+                before_feedback=before_feedback,
             )
             if ok is False:
                 return False, msg
@@ -951,20 +973,36 @@ class FeishuUploader:
             current = self._capture_custom_sticker_signature()
             if current and not baseline:
                 return True, "custom emoji panel is now populated after upload"
-            if len(current) > len(baseline):
-                return True, "custom emoji count increased after upload"
             if current and baseline:
-                shifted = current[: min(len(current), len(baseline) + 1)]
-                if len(shifted) >= 2 and shifted[1:] == baseline[: len(shifted) - 1]:
+                if current[0] not in baseline and current[1:] == baseline[: len(current) - 1]:
                     return True, "new custom emoji appeared at the front of the list"
-                if current != baseline and current[0] != baseline[0]:
-                    return True, "custom emoji list changed after upload"
             time.sleep(0.4)
         return False, "未检测到明确成功提示或列表变化，已按失败处理"
 
+    def wait_for_browser_close(self, stop_check: StopCheck = None) -> None:
+        """处理未完成时保留现场，浏览器操作仍留在所属线程。"""
+        if self.headless or not self._context:
+            return
+        self._report(
+            "[检查] 本次处理未完成，飞书浏览器保留供检查；"
+            "关闭该浏览器窗口或点击「停止上传」后，工具才会结束本次处理"
+        )
+        while not self._stop_requested(stop_check):
+            try:
+                pages = [page for page in self._context.pages if not page.is_closed()]
+                if not pages:
+                    return
+                pages[0].wait_for_timeout(250)
+            except Exception:
+                return
+
     def close(self):
         """关闭浏览器，保存登录态。"""
-        for obj, method in ((self._browser, "close"), (self._playwright_driver, "stop")):
+        for obj, method in (
+            (self._context, "close"),
+            (self._browser, "close"),
+            (self._playwright_driver, "stop"),
+        ):
             if obj:
                 try:
                     getattr(obj, method)()
@@ -982,6 +1020,8 @@ class FeishuUploader:
         return self
 
     def __exit__(self, *args):
+        if args[0] is not None:
+            self.wait_for_browser_close()
         self.close()
 
 
@@ -1007,16 +1047,21 @@ def upload_emojis(
 
     with FeishuUploader(headless=headless, progress_callback=progress_callback) as uploader:
         if not uploader.login():
+            uploader.wait_for_browser_close()
             return {"success": 0, "failed": len(emoji_files)}
         if mode == "personal":
-            return uploader.upload_personal_emojis(emoji_files)
-        if mode == "enterprise":
-            return uploader.upload_enterprise_emojis(emoji_files, pack_name=pack_name)
-        msg = f"[错误] 未知模式: {mode}"
-        print(msg)
-        if progress_callback:
-            progress_callback(0, 0, msg)
-        return {"success": 0, "failed": len(emoji_files)}
+            result = uploader.upload_personal_emojis(emoji_files)
+        elif mode == "enterprise":
+            result = uploader.upload_enterprise_emojis(emoji_files, pack_name=pack_name)
+        else:
+            msg = f"[错误] 未知模式: {mode}"
+            print(msg)
+            if progress_callback:
+                progress_callback(0, 0, msg)
+            return {"success": 0, "failed": len(emoji_files)}
+        if result.get("failed") or result.get("skipped"):
+            uploader.wait_for_browser_close()
+        return result
 
 
 def _is_browser_running(name: str) -> bool:

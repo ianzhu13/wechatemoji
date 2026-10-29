@@ -20,7 +20,8 @@ class Api:
     """Python API exposed to frontend JS."""
 
     def __init__(self):
-        self.window = None
+        # pywebview 会递归导出公开属性，原生窗口必须保留为内部引用。
+        self._window = None
         self.emoji_files: list[str] = []
         self.upload_env: dict = {
             "ok": False,
@@ -45,9 +46,9 @@ class Api:
         while True:
             try:
                 js_code = self._emit_queue.get(timeout=0.05)
-                if self.window:
+                if self._window:
                     try:
-                        self.window.evaluate_js(js_code)
+                        self._window.evaluate_js(js_code)
                     except Exception:
                         pass
             except queue.Empty:
@@ -85,7 +86,7 @@ class Api:
         self._emit_db_path_for_user(data)
 
     def browseWechatDir(self):
-        result = self.window.create_file_dialog(
+        result = self._window.create_file_dialog(
             webview.FOLDER_DIALOG, directory=config.WECHAT_FILES_ROOT
         )
         if not result:
@@ -95,7 +96,7 @@ class Api:
         self.detectWechat()
 
     def browseOutputDir(self):
-        result = self.window.create_file_dialog(
+        result = self._window.create_file_dialog(
             webview.FOLDER_DIALOG, directory=config.EMOJI_OUTPUT_DIR
         )
         if not result:
@@ -309,7 +310,7 @@ class Api:
     # ---- Load from folder ----
 
     def loadFromFolder(self):
-        result = self.window.create_file_dialog(webview.FOLDER_DIALOG, directory=config.EMOJI_OUTPUT_DIR)
+        result = self._window.create_file_dialog(webview.FOLDER_DIALOG, directory=config.EMOJI_OUTPUT_DIR)
         if not result:
             return
 
@@ -327,7 +328,7 @@ class Api:
         self._log(f"已从目录加载 {len(files)} 个表情文件")
 
     def loadEmojiFiles(self):
-        result = self.window.create_file_dialog(
+        result = self._window.create_file_dialog(
             webview.OPEN_DIALOG,
             directory=config.EMOJI_OUTPUT_DIR,
             allow_multiple=True,
@@ -418,6 +419,8 @@ class Api:
                 uploader = FeishuUploader(headless=False, progress_callback=self._on_upload_progress)
                 uploader.start()
                 if not uploader.login(stop_check=self._should_stop_upload):
+                    if not self._should_stop_upload():
+                        uploader.wait_for_browser_close(stop_check=self._should_stop_upload)
                     self._on_upload_done({"success": 0, "failed": 0, "stopped": self._should_stop_upload()})
                     return
 
@@ -429,6 +432,10 @@ class Api:
                         pack_name=pack_name,
                         stop_check=self._should_stop_upload,
                     )
+                if (result.get("failed") or result.get("skipped")) and not self._should_stop_upload():
+                    if result.get("message"):
+                        self._log(result["message"], "warn")
+                    uploader.wait_for_browser_close(stop_check=self._should_stop_upload)
                 result["stopped"] = self._should_stop_upload()
                 self._on_upload_done(result)
             except Exception as exc:
@@ -437,6 +444,8 @@ class Api:
                     "uploadStatus",
                     {"text": f"飞书导入失败：{exc}", "tone": "error"},
                 )
+                if uploader and not self._should_stop_upload():
+                    uploader.wait_for_browser_close(stop_check=self._should_stop_upload)
                 self._on_upload_done({"success": 0, "failed": len(files)})
             finally:
                 if uploader:
@@ -510,14 +519,23 @@ class Api:
         self._log(message)
 
     def _on_upload_done(self, result):
-        self._set_busy(False, "")
         success = result.get("success", 0)
         failed = result.get("failed", 0)
         stopped = bool(result.get("stopped"))
+        skipped = result.get("skipped", 0)
+        if skipped:
+            summary = result.get("message", f"导入已中断：成功 {success}，失败 {failed}，未尝试 {skipped}")
+            processed = success + failed
+            self._set_progress("upload", int(100 * processed / (processed + skipped)))
+            self._emit("uploadStatus", {"text": summary, "tone": "warning"})
+            self._log(summary, "warn")
+            self._set_busy(False, "")
+            return
         if stopped:
             summary = f"导入已停止：成功 {success}，失败 {failed}"
             self._emit("uploadStatus", {"text": summary, "tone": "warning"})
             self._log(summary, "warn")
+            self._set_busy(False, "")
             return
         tone = "success" if failed == 0 and success > 0 else ("warning" if success > 0 else "error")
         self._set_progress("upload", 100 if success or failed else 0)
@@ -526,6 +544,7 @@ class Api:
             {"text": f"导入完成：成功 {success}，失败 {failed}", "tone": tone},
         )
         self._log(f"飞书导入完成：成功 {success}，失败 {failed}", "success" if failed == 0 else "warn")
+        self._set_busy(False, "")
 
     # ---- Emoji thumbs ----
 
@@ -637,7 +656,7 @@ class Api:
         )
 
     def _emit_js(self, js_code: str):
-        if not self.window:
+        if not self._window:
             return
         self._emit_queue.put(js_code)  # 不直接调用，入队后由 drainer 串行处理
 
@@ -655,7 +674,7 @@ def run_gui():
         resizable=True,
         text_select=False,
     )
-    api.window = window
+    api._window = window
     webview.start(debug=False, gui="edgechromium")
 
 
